@@ -510,4 +510,62 @@ EOM;
         $this->assertSame(1, $factory->calls);
     }
 
+    public function testInProgressWithoutRetryAfterWaitsAndReportsUnknownOutcome(): void
+    {
+        $factory = new class {
+            public int $calls = 0;
+            public array $keys = [];
+            public function create($url, $options, $caller) {
+                $this->calls++;
+                return new class($this) {
+                    private $factory;
+                    public function __construct($factory) { $this->factory = $factory; }
+                    public function setHeader($name, $value) {
+                        if ($name === 'Idempotency-Key') { $this->factory->keys[] = $value; }
+                    }
+                    public function execute() { return new class { public function isOK() { return false; } }; }
+                    public function getStatus() { return 409; }
+                    public function getContent() {
+                        return '{"type":"https://mailapi.github.io/problems/idempotency-key-in-progress"}';
+                    }
+                };
+            }
+        };
+        $started = microtime(true);
+        try {
+            (new Client('http://localhost:8080', $factory))->send(['text' => 'Hello'], 'stable-key');
+            $this->fail('Expected an unknown outcome');
+        } catch (\MediaWiki\Extension\MailAPI\OutcomeUnknownException $e) {
+            $this->assertStringContainsString('may still be sent', $e->getMessage());
+            $this->assertInstanceOf(MWException::class, $e->getPrevious());
+        }
+        $this->assertSame(3, $factory->calls);
+        $this->assertSame(['stable-key', 'stable-key', 'stable-key'], $factory->keys);
+        $this->assertGreaterThanOrEqual(1.9, microtime(true) - $started);
+    }
+
+    public function testLongRetryAfterIsNotRetriedEarly(): void
+    {
+        $factory = new class {
+            public int $calls = 0;
+            public function create($url, $options, $caller) {
+                $this->calls++;
+                return new class {
+                    public function setHeader($name, $value) {}
+                    public function execute() { return new class { public function isOK() { return false; } }; }
+                    public function getStatus() { return 429; }
+                    public function getResponseHeader($name) { return '30'; }
+                    public function getContent() { return '{"title":"Rate limited"}'; }
+                };
+            }
+        };
+        try {
+            (new Client('http://localhost:8080', $factory))->send(['text' => 'Hello']);
+            $this->fail('Expected rejection');
+        } catch (MWException $e) {
+            $this->assertStringContainsString('HTTP 429', $e->getMessage());
+        }
+        $this->assertSame(1, $factory->calls);
+    }
+
 }

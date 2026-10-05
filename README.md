@@ -56,7 +56,6 @@ $wgMailAPIToken = getenv( 'MAILAPI_TOKEN' ) ?: ''; // provider-issued secret tok
 | :--- | :--- | :--- | :--- |
 | `$wgMailAPIEndpoint` | `string` | `""` | The base URL or full endpoint URL (`/v1/messages`) of the Mail API service. |
 | `$wgMailAPIToken` | `string` | `""` | Provider-issued bearer token. Required by resend-mailer v0.3.0. Empty omits Authorization for providers using a deployment-specific equivalent scheme. |
-
 | `$wgMailAPIWaitTimeout` | `int` | `10` | Prefer waiting for completion for 0–20 seconds; 0 disables waiting. |
 
 ## How It Works
@@ -85,6 +84,22 @@ composer install
 ./vendor/bin/phpunit
 ```
 
+For a disposable installed MediaWiki instance with this extension loaded, start the local-only mock router and run the real hook smoke test:
+
+```bash
+php -S 127.0.0.1:8099 extensions/MailAPI/tests/maintenance/smokeRouter.php
+# In another shell, from the MediaWiki installation directory:
+php extensions/MailAPI/tests/maintenance/mailapiSmoke.php --endpoint http://127.0.0.1:8099
+```
+
+This checks success, terminal failure, in-progress exhaustion, and transport failure through `UserMailer::send()` and the real HookContainer without sending email.
+
 ## License
 
 [Apache License 2.0](LICENSE)
+
+## Hook ordering and uncertain outcomes
+
+MailAPI submits during `UserMailerTransformMessage`. Register other message-transforming or aborting handlers before MailAPI; handlers that run afterwards cannot change the submitted message or undo it. This must be checked when installing other mail-related extensions.
+
+In-progress conflicts wait at least one second between attempts. If transport failures or in-progress responses exhaust retries, MediaWiki reports an unknown outcome: the message may still be sent, so do not immediately submit it again with a new key. Detailed errors and exception traces are logged rather than shown to users. Out-of-range `MailAPIWaitTimeout` settings log a warning and use the default of 10 seconds.

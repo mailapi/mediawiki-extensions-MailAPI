@@ -187,6 +187,6 @@ PHP;
         );
         $this->assertFalse($result);
         $this->assertFalse($ret);
-        $this->assertStringContainsString('Mail API submission failed', $error);
+        $this->assertSame('Mail API submission failed. Please contact the wiki administrator.', $error);
     }
 }

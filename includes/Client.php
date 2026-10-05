@@ -496,6 +496,7 @@ class Client
             $headers['Authorization'] = 'Bearer ' . $this->token;
         }
         $deadline = microtime(true) + 30;
+        $outcomeUnknown = false;
         for ($attempt = 0; ; $attempt++) {
             $this->lastStatus = 0;
             $this->retryAfter = null;
@@ -509,12 +510,22 @@ class Client
             try {
                 return $this->sendOnce($json, $requestHeaders, $timeout);
             } catch (MWException $e) {
+                $inProgress = $this->lastStatus === 409 && $this->lastProblemType ===
+                    'https://mailapi.github.io/problems/idempotency-key-in-progress';
+                $outcomeUnknown = $outcomeUnknown || $this->lastStatus === 0 || $inProgress;
                 $retryable = in_array($this->lastStatus, [0, 429, 503], true) ||
                     ($this->lastStatus === 409 && $this->lastProblemType ===
                         'https://mailapi.github.io/problems/idempotency-key-in-progress');
                 $delay = $this->retryDelay();
                 if (!$retryable || $attempt >= 2 || $delay === null ||
                     microtime(true) + $delay + 1 >= $deadline) {
+                    if ($outcomeUnknown) {
+                        throw new OutcomeUnknownException(
+                            'Mail API submission outcome is unknown. The message may still be sent; do not immediately resubmit.',
+                            0,
+                            $e
+                        );
+                    }
                     throw $e;
                 }
                 usleep((int)($delay * 1000000));
@@ -525,7 +536,8 @@ class Client
     private function retryDelay(): ?float
     {
         if ($this->retryAfter === null || $this->retryAfter === '') {
-            return 0.1;
+            return $this->lastProblemType ===
+                'https://mailapi.github.io/problems/idempotency-key-in-progress' ? 1.0 : 0.1;
         }
         if (ctype_digit($this->retryAfter)) {
             $delay = (float)$this->retryAfter;
@@ -537,7 +549,11 @@ class Client
             $delay = max(0, $timestamp - time());
         }
         // A long Retry-After is reported rather than retried prematurely.
-        return $delay <= 2 ? $delay : null;
+        if ($delay > 2) {
+            return null;
+        }
+        return $this->lastProblemType ===
+            'https://mailapi.github.io/problems/idempotency-key-in-progress' ? max(1, $delay) : $delay;
     }
 
     private function sendOnce(string $json, array $requestHeaders, float $timeout): array

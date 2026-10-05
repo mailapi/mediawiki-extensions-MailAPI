@@ -46,8 +46,10 @@ class Hooks implements AlternateUserMailerHook, UserMailerTransformMessageHook
             );
             return true;
         } catch (Throwable $e) {
-            $error = 'Mail API submission failed: ' . $e->getMessage();
-            $this->log('error', 'MailAPI submission failed: {error}', ['error' => $e->getMessage()]);
+            $error = $e instanceof OutcomeUnknownException
+                ? 'Mail submission outcome is unknown. The message may still be sent; do not immediately resend.'
+                : 'Mail API submission failed. Please contact the wiki administrator.';
+            $this->log('error', 'MailAPI submission failed: {error}', ['error' => $e->getMessage(), 'exception' => $e]);
             return false;
         }
     }
@@ -76,6 +78,11 @@ class Hooks implements AlternateUserMailerHook, UserMailerTransformMessageHook
             if (!isset($wgMailAPIWaitTimeout) && $config->has('MailAPIWaitTimeout')) {
                 $waitTimeout = (int)$config->get('MailAPIWaitTimeout');
             }
+        }
+        if ($waitTimeout < 0 || $waitTimeout > 20) {
+            $this->log('warning', 'Invalid MailAPIWaitTimeout {value}; using the default of 10 seconds.',
+                ['value' => $waitTimeout]);
+            $waitTimeout = 10;
         }
         return [$endpoint, $token, $waitTimeout];
     }

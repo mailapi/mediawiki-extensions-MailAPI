@@ -47,7 +47,7 @@ class HooksTest extends TestCase
         $hooks = new Hooks($logger);
         $settings = new \ReflectionMethod($hooks, 'settings');
         $settings->setAccessible(true);
-        $this->assertSame(10, $settings->invoke($hooks)[2]);
+        $this->assertSame(0, $settings->invoke($hooks)[2]);
         $this->assertCount(1, $logger->warnings);
         $this->assertSame(30, $logger->warnings[0][1]['value']);
     }

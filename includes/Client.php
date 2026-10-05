@@ -9,6 +9,12 @@ class Client
 {
     private const IN_PROGRESS_TYPE = 'https://mailapi.github.io/problems/idempotency-key-in-progress';
 
+    /** Seconds to wait for acceptance when no Prefer wait is configured. */
+    private const HANDOFF_TIMEOUT = 5;
+
+    /** Extra seconds allowed for retrying certain rejections. */
+    private const RETRY_BUDGET = 5;
+
     /** @var string */
     private $endpoint;
 
@@ -29,7 +35,7 @@ class Client
      * @param mixed|null $httpRequestFactory
      * @throws MWException
      */
-    public function __construct(string $endpoint, $httpRequestFactory = null, string $token = '', int $waitTimeout = 10)
+    public function __construct(string $endpoint, $httpRequestFactory = null, string $token = '', int $waitTimeout = 0)
     {
         $this->endpoint = self::normalizeEndpoint($endpoint);
         $this->httpRequestFactory = $httpRequestFactory;
@@ -498,31 +504,29 @@ class Client
         if ($this->token !== '') {
             $headers['Authorization'] = 'Bearer ' . $this->token;
         }
-        $deadline = microtime(true) + 30;
-        // Set once any attempt may have reached the provider without a known result.
-        $outcomeUnknown = false;
+        if ($this->waitTimeout > 0) {
+            $headers['Prefer'] = 'wait=' . $this->waitTimeout;
+        }
+        // Hand off quickly, like an MTA accepting a message. Only rejections that
+        // certainly did not start the submission are retried, briefly.
+        $attemptTimeout = $this->waitTimeout > 0 ? $this->waitTimeout + 2 : self::HANDOFF_TIMEOUT;
+        $deadline = microtime(true) + $attemptTimeout + self::RETRY_BUDGET;
         for ($attempt = 0; ; $attempt++) {
             $this->lastStatus = 0;
             $this->retryAfter = null;
             $this->lastProblemType = '';
             $this->lastConnectFailed = false;
-            $remaining = $deadline - microtime(true);
-            $timeout = min($remaining, max(5, $this->waitTimeout + 2));
-            $requestHeaders = $headers;
-            if ($this->waitTimeout > 0) {
-                $requestHeaders['Prefer'] = 'wait=' . min($this->waitTimeout, max(0, (int)$timeout - 2));
-            }
+            $timeout = min($attemptTimeout, $deadline - microtime(true));
             try {
-                return $this->sendOnce($json, $requestHeaders, $timeout);
+                return $this->sendOnce($json, $headers, $timeout);
             } catch (MWException $e) {
-                $inProgress = $this->isInProgress();
-                $outcomeUnknown = $outcomeUnknown || $inProgress ||
-                    ($this->lastStatus === 0 && !$this->lastConnectFailed);
-                $retryable = in_array($this->lastStatus, [0, 429, 503], true) || $inProgress;
+                $retryable = in_array($this->lastStatus, [429, 503], true) ||
+                    ($this->lastStatus === 0 && $this->lastConnectFailed);
                 $delay = $this->retryDelay();
                 if (!$retryable || $attempt >= 2 || $delay === null ||
                     microtime(true) + $delay + 1 >= $deadline) {
-                    if ($outcomeUnknown && !$this->isDefinitiveFailure()) {
+                    // Each retry was certainly rejected, so only the last attempt decides.
+                    if ($this->isInProgress() || ($this->lastStatus === 0 && !$this->lastConnectFailed)) {
                         throw new OutcomeUnknownException(
                             'Mail API submission outcome is unknown. The message may still be sent; do not immediately resubmit.',
                             0,
@@ -542,20 +546,6 @@ class Client
     }
 
     /**
-     * Whether the last response settles the outcome for this key. Validation and
-     * authorization errors are deterministic for an identical request, so an
-     * earlier attempt was rejected too; a Problem 500 is the terminal outcome.
-     */
-    private function isDefinitiveFailure(): bool
-    {
-        $status = $this->lastStatus;
-        if ($status >= 400 && $status < 500) {
-            return !in_array($status, [408, 429], true) && !$this->isInProgress();
-        }
-        return $status === 500 && $this->lastProblemType !== '';
-    }
-
-    /**
      * Recognize failures where no connection was established, so the request
      * cannot have reached the provider. Unrecognized errors stay ambiguous.
      */
@@ -571,7 +561,7 @@ class Client
     private function retryDelay(): ?float
     {
         if ($this->retryAfter === null || $this->retryAfter === '') {
-            return $this->lastProblemType === self::IN_PROGRESS_TYPE ? 1.0 : 0.1;
+            return 0.1;
         }
         if (ctype_digit($this->retryAfter)) {
             $delay = (float)$this->retryAfter;
@@ -586,7 +576,7 @@ class Client
         if ($delay > 2) {
             return null;
         }
-        return $this->lastProblemType === self::IN_PROGRESS_TYPE ? max(1, $delay) : $delay;
+        return $delay;
     }
 
     private function sendOnce(string $json, array $requestHeaders, float $timeout): array

@@ -18,7 +18,7 @@ class MailAPISmoke extends Maintenance
         global $wgMailAPIEndpoint, $wgMailAPIToken, $wgMailAPIWaitTimeout;
         $base = rtrim($this->getOption('endpoint'), '/');
         $wgMailAPIToken = 'smoke-token';
-        $wgMailAPIWaitTimeout = 2;
+        $wgMailAPIWaitTimeout = 0;
         foreach (['success', 'terminal', 'pending', 'transport'] as $scenario) {
             $wgMailAPIEndpoint = $scenario === 'transport'
                 ? 'http://127.0.0.1:1' : $base . '/' . $scenario;

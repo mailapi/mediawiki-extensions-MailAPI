@@ -56,7 +56,7 @@ $wgMailAPIToken = getenv( 'MAILAPI_TOKEN' ) ?: ''; // provider-issued secret tok
 | :--- | :--- | :--- | :--- |
 | `$wgMailAPIEndpoint` | `string` | `""` | The base URL or full endpoint URL (`/v1/messages`) of the Mail API service. |
 | `$wgMailAPIToken` | `string` | `""` | Provider-issued bearer token. Required by resend-mailer v0.3.0. Empty omits Authorization for providers using a deployment-specific equivalent scheme. |
-| `$wgMailAPIWaitTimeout` | `int` | `10` | Prefer waiting for completion for 0–20 seconds; 0 disables waiting. |
+| `$wgMailAPIWaitTimeout` | `int` | `0` | Seconds (0–20) to ask the provider to wait for dispatch with `Prefer: wait`. `0` hands off on `202` without waiting, like an MTA accepting a message. |
 
 ## How It Works
 
@@ -73,7 +73,7 @@ $wgMailAPIToken = getenv( 'MAILAPI_TOKEN' ) ?: ''; // provider-issued secret tok
 
 ## Upgrading from v0.1.x
 
-Configure `$wgMailAPIToken` before connecting to resend-mailer v0.3.0. Both HTTP `200` and `202` are successful submission responses. A configured provider failure now stops mail submission instead of silently trying the default transport; inspect the `mailapi` log when MediaWiki reports a mail error. The client retries transport failures, HTTP 429/503, and in-progress idempotency conflicts up to twice with the same key and body, within a 30-second budget. Terminal failures are reported through the transform hook error parameter with a boolean return, as required by MediaWiki. Retry-After values above two seconds are reported rather than retried early. A 202 response still means acceptance only. Direct Client callers may pass a stable key to `send($payload, $key)` for retries across calls; MediaWiki job-level retries do not automatically share that key.
+Configure `$wgMailAPIToken` before connecting to resend-mailer v0.3.0. Both HTTP `200` and `202` are successful submission responses. A configured provider failure now stops mail submission instead of silently trying the default transport; inspect the `mailapi` log when MediaWiki reports a mail error. The client hands off quickly: each attempt waits 5 seconds for acceptance (or `$wgMailAPIWaitTimeout` plus 2 seconds when waiting is enabled), and only rejections that certainly did not start the submission (HTTP 429/503, DNS failure, refused connection) are retried, up to twice with the same key and body and within 5 extra seconds. Failures after acceptance are the provider's responsibility and appear in its logs, not in MediaWiki. Terminal failures are reported through the transform hook error parameter with a boolean return, as required by MediaWiki. Retry-After values above two seconds are reported rather than retried early. A 202 response still means acceptance only. Direct Client callers may pass a stable key to `send($payload, $key)` for retries across calls; MediaWiki job-level retries do not automatically share that key.
 
 ## Testing
 
@@ -102,4 +102,4 @@ This checks success, terminal failure, in-progress exhaustion, and transport fai
 
 MailAPI submits during `UserMailerTransformMessage`. Register other message-transforming or aborting handlers before MailAPI; handlers that run afterwards cannot change the submitted message or undo it. This must be checked when installing other mail-related extensions.
 
-In-progress conflicts wait at least one second between attempts. If ambiguous transport failures (such as timeouts) or in-progress responses exhaust retries, MediaWiki reports an unknown outcome: the message may still be sent, so do not immediately submit it again with a new key. A failure is reported as known instead when the last response settles it (a Problem Details `500` or a deterministic `4xx` such as `401` or `422`), or when no attempt could have reached the provider (DNS failure or refused connection). Detailed errors and exception traces are logged rather than shown to users. Out-of-range `MailAPIWaitTimeout` settings log a warning and use the default of 10 seconds.
+A timeout or other ambiguous transport failure, or an in-progress conflict, is not retried: MediaWiki reports an unknown outcome because the message may still be sent, so do not immediately submit it again with a new key. Other failures are reported as known. Detailed errors and exception traces are logged rather than shown to users. Out-of-range `MailAPIWaitTimeout` settings log a warning and disable waiting.

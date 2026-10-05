@@ -66,7 +66,7 @@ class Hooks implements AlternateUserMailerHook, UserMailerTransformMessageHook
         global $wgMailAPIEndpoint, $wgMailAPIToken, $wgMailAPIWaitTimeout;
         $endpoint = (string)($wgMailAPIEndpoint ?? '');
         $token = (string)($wgMailAPIToken ?? '');
-        $waitTimeout = (int)($wgMailAPIWaitTimeout ?? 10);
+        $waitTimeout = (int)($wgMailAPIWaitTimeout ?? 0);
         if (class_exists(MediaWikiServices::class)) {
             $config = MediaWikiServices::getInstance()->getMainConfig();
             if ($endpoint === '' && $config->has('MailAPIEndpoint')) {
@@ -80,9 +80,9 @@ class Hooks implements AlternateUserMailerHook, UserMailerTransformMessageHook
             }
         }
         if ($waitTimeout < 0 || $waitTimeout > 20) {
-            $this->log('warning', 'Invalid MailAPIWaitTimeout {value}; using the default of 10 seconds.',
+            $this->log('warning', 'Invalid MailAPIWaitTimeout {value}; waiting is disabled.',
                 ['value' => $waitTimeout]);
-            $waitTimeout = 10;
+            $waitTimeout = 0;
         }
         return [$endpoint, $token, $waitTimeout];
     }

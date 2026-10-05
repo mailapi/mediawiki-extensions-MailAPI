@@ -12,13 +12,15 @@ class HooksTest extends TestCase
     protected function tearDown(): void
     {
         parent::tearDown();
-        global $wgMailAPIEndpoint;
+        global $wgMailAPIEndpoint, $wgMailAPIToken;
+        $wgMailAPIToken = null;
         $wgMailAPIEndpoint = null;
     }
 
     public function testOnAlternateUserMailerWithoutEndpointFallsBackToDefaultMailer(): void
     {
-        global $wgMailAPIEndpoint;
+        global $wgMailAPIEndpoint, $wgMailAPIToken;
+        $wgMailAPIToken = null;
         $wgMailAPIEndpoint = '';
 
         $hooks = new Hooks();

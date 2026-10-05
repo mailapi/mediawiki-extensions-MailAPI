@@ -4,8 +4,8 @@ MediaWiki extension that sends emails through an external service conforming to 
 
 ## Features
 
-- **Mail API Compliant**: Strictly follows the vendor-neutral [Mail API OpenAPI Specification](https://github.com/mailapi/mailapi/blob/main/openapi.yaml).
-- **Simple Configuration**: Requires only `$wgMailAPIEndpoint` without authentication credentials.
+- **Mail API Compliant**: Targets v0.4.4 of the vendor-neutral [Mail API OpenAPI Specification](https://github.com/mailapi/mailapi/blob/v0.4.4/openapi.yaml).
+- **Simple Configuration**: Uses `$wgMailAPIEndpoint` and `$wgMailAPIToken` for bearer-authenticated providers.
 - **Hook Integration**: Uses MediaWiki's standard `AlternateUserMailer` hook to intercept and route all outgoing emails.
 - **Problem Details Handling**: Parses RFC 9457 Problem Details responses from the Mail API server for clear error reporting.
 
@@ -47,6 +47,7 @@ Add the following lines to your `LocalSettings.php`:
 ```php
 wfLoadExtension( 'MailAPI' );
 $wgMailAPIEndpoint = 'http://localhost:8080'; // or 'http://localhost:8080/v1/messages'
+$wgMailAPIToken = getenv( 'MAILAPI_TOKEN' ) ?: ''; // provider-issued secret token
 ```
 
 ### Configuration Options
@@ -54,6 +55,8 @@ $wgMailAPIEndpoint = 'http://localhost:8080'; // or 'http://localhost:8080/v1/me
 | Variable | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `$wgMailAPIEndpoint` | `string` | `""` | The base URL or full endpoint URL (`/v1/messages`) of the Mail API service. |
+
+| `$wgMailAPIToken` | `string` | `""` | Provider-issued bearer token. Required by resend-mailer v0.3.0. Empty omits Authorization for providers using a deployment-specific equivalent scheme. |
 
 ## How It Works
 
@@ -65,8 +68,12 @@ $wgMailAPIEndpoint = 'http://localhost:8080'; // or 'http://localhost:8080/v1/me
    - `text`: `"..."` / `html`: `"..."`
    - `replyTo` / `cc` / `bcc`: `[ { "email": "...", ... } ]` (extracted from headers if present)
    - `headers`: `[ { "name": "...", "value": "..." } ]` (supplemental headers)
-3. **HTTP Dispatch**: Sends an HTTP `POST` request with `Content-Type: application/json` to `/v1/messages`.
-4. **Result Handling**: On success (HTTP 200), skips MediaWiki's default mail transport and logs the Mail API message ID. On failure, logs the RFC 9457 problem details and falls back to MediaWiki's default mail transport.
+3. **HTTP Dispatch**: Sends an HTTP `POST` request with `Content-Type: application/json` to `/v1/messages`, with a fresh `Idempotency-Key` for each message and `Authorization: Bearer <token>` when configured.
+4. **Result Handling**: On acceptance (HTTP 200 or 202), skips MediaWiki's default mail transport and logs the Mail API message ID; this does not confirm delivery. On failure, logs RFC 9457 problem details and returns an error to MediaWiki without falling back to SMTP, avoiding duplicate submissions after an ambiguous failure. An unconfigured endpoint still uses the default mailer.
+
+## Upgrading from v0.1.x
+
+Configure `$wgMailAPIToken` before connecting to resend-mailer v0.3.0. Both HTTP `200` and `202` are successful submission responses. A configured provider failure now stops mail submission instead of silently trying the default transport; inspect the `mailapi` log when MediaWiki reports a mail error. The client does not automatically retry failed submissions.
 
 ## Testing
 

@@ -43,6 +43,11 @@ class IntegrationTest extends TestCase
 \$method = \$_SERVER['REQUEST_METHOD'];
 
 if (\$uri === '/v1/messages' && \$method === 'POST') {
+    if ((\$_SERVER['HTTP_AUTHORIZATION'] ?? '') !== 'Bearer integration-token' || !preg_match('/^[a-f0-9]{32}$/', \$_SERVER['HTTP_IDEMPOTENCY_KEY'] ?? '')) {
+        http_response_code(401);
+        echo json_encode(['type' => 'https://mailapi.github.io/problems/unauthenticated', 'title' => 'Unauthenticated', 'status' => 401]);
+        exit;
+    }
     \$body = file_get_contents('php://input');
     file_put_contents({$reqFileEscaped}, \$body);
 
@@ -59,7 +64,7 @@ if (\$uri === '/v1/messages' && \$method === 'POST') {
         exit;
     }
 
-    http_response_code(200);
+    http_response_code(202);
     header('Content-Type: application/json');
     echo json_encode(['id' => 'msg_integration_test_ok']);
     exit;
@@ -101,7 +106,7 @@ PHP;
 
     public function testEndToEndSendWithMockServer(): void
     {
-        $client = new Client('http://127.0.0.1:' . self::$serverPort);
+        $client = new Client('http://127.0.0.1:' . self::$serverPort, null, 'integration-token');
         $payload = $client->buildPayload(
             ['X-Test' => 'Integration'],
             new MailAddress('recipient@example.com', 'Recipient Name'),
@@ -128,7 +133,8 @@ PHP;
 
     public function testHooksEndToEnd(): void
     {
-        global $wgMailAPIEndpoint;
+        global $wgMailAPIEndpoint, $wgMailAPIToken;
+        $wgMailAPIToken = 'integration-token';
         $wgMailAPIEndpoint = 'http://127.0.0.1:' . self::$serverPort;
 
         $hooks = new Hooks();
@@ -144,9 +150,10 @@ PHP;
         $this->assertFalse($ret);
     }
 
-    public function testHooksErrorFallsBackToDefaultMailer(): void
+    public function testHooksErrorStopsDefaultMailer(): void
     {
-        global $wgMailAPIEndpoint;
+        global $wgMailAPIEndpoint, $wgMailAPIToken;
+        $wgMailAPIToken = 'integration-token';
         $wgMailAPIEndpoint = 'http://127.0.0.1:' . self::$serverPort . '/nonexistent';
 
         $hooks = new Hooks();
@@ -158,7 +165,8 @@ PHP;
             'Hello from Hook'
         );
 
-        // On failure, it allows MediaWiki's default mailer to handle the message.
-        $this->assertTrue($ret);
+        // An ambiguous failure must not submit the same message through SMTP.
+        $this->assertIsString($ret);
+        $this->assertStringContainsString('Mail API submission failed', $ret);
     }
 }

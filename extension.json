@@ -1,6 +1,6 @@
 {
 	"name": "MailAPI",
-	"version": "0.1.1",
+	"version": "0.2.0",
 	"author": [
 		"jmnote"
 	],
@@ -26,6 +26,10 @@
 		"MailAPIEndpoint": {
 			"value": "",
 			"description": "The base URL or endpoint of the Mail API service (e.g. http://localhost:8080 or http://localhost:8080/v1/messages)"
+		},
+		"MailAPIToken": {
+			"value": "",
+			"description": "Provider-issued bearer token for the Mail API service; keep this secret."
 		}
 	},
 	"manifest_version": 2

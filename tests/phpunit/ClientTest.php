@@ -448,4 +448,66 @@ EOM;
         $this->assertSame([['email' => 'one@example.com'], ['email' => 'two@example.com']], $payload['cc']);
     }
 
+    public function testRetriesKeepIdenticalPayloadAndKey(): void
+    {
+        foreach ([0, 429, 503, 409] as $initialStatus) {
+            $factory = new class($initialStatus) {
+                public array $requests = [];
+                private int $initialStatus;
+                public function __construct($status) { $this->initialStatus = $status; }
+                public function create($url, $options, $caller) {
+                    $status = count($this->requests) === 0 ? $this->initialStatus : 200;
+                    $request = new class($status, $options) {
+                        public array $headers = [];
+                        public array $options;
+                        private int $status;
+                        public function __construct($status, $options) { $this->status = $status; $this->options = $options; }
+                        public function setHeader($name, $value) { $this->headers[$name] = $value; }
+                        public function execute() { return new class { public function isOK() { return true; } }; }
+                        public function getStatus() { return $this->status; }
+                        public function getResponseHeader($name) { return '0'; }
+                        public function getContent() {
+                            return $this->status === 200 ? '{"id":"done"}' :
+                                '{"type":"https://mailapi.github.io/problems/idempotency-key-in-progress","title":"Retry"}';
+                        }
+                    };
+                    $this->requests[] = $request;
+                    return $request;
+                }
+            };
+            $client = new Client('http://localhost:8080', $factory, 'token');
+            $this->assertSame(['id' => 'done'], $client->send(['text' => 'Hello'], 'logical-message-1'));
+            $this->assertCount(2, $factory->requests);
+            $this->assertSame($factory->requests[0]->options['postData'], $factory->requests[1]->options['postData']);
+            foreach ($factory->requests as $request) {
+                $this->assertSame('logical-message-1', $request->headers['Idempotency-Key']);
+                $this->assertSame('wait=10', $request->headers['Prefer']);
+                $this->assertLessThanOrEqual(30, $request->options['timeout']);
+            }
+        }
+    }
+
+    public function testTerminalFailureIsNeverRetried(): void
+    {
+        $factory = new class {
+            public int $calls = 0;
+            public function create($url, $options, $caller) {
+                $this->calls++;
+                return new class {
+                    public function setHeader($name, $value) {}
+                    public function execute() { return new class { public function isOK() { return false; } }; }
+                    public function getStatus() { return 500; }
+                    public function getContent() { return '{"title":"Terminal failure"}'; }
+                };
+            }
+        };
+        try {
+            (new Client('http://localhost:8080', $factory))->send(['text' => 'Hello']);
+            $this->fail('Expected a terminal failure');
+        } catch (MWException $e) {
+            $this->assertStringContainsString('HTTP 500', $e->getMessage());
+        }
+        $this->assertSame(1, $factory->calls);
+    }
+
 }

@@ -50,3 +50,11 @@ namespace MediaWiki\Hook {
         }
     }
 }
+
+namespace MediaWiki\Hook {
+    if (!interface_exists(UserMailerTransformMessageHook::class)) {
+        interface UserMailerTransformMessageHook {
+            public function onUserMailerTransformMessage($to, $from, &$subject, &$headers, &$body, &$error);
+        }
+    }
+}

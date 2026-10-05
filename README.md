@@ -6,7 +6,7 @@ MediaWiki extension that sends emails through an external service conforming to 
 
 - **Mail API Compliant**: Targets v0.4.4 of the vendor-neutral [Mail API OpenAPI Specification](https://github.com/mailapi/mailapi/blob/v0.4.4/openapi.yaml).
 - **Simple Configuration**: Uses `$wgMailAPIEndpoint` and `$wgMailAPIToken` for bearer-authenticated providers.
-- **Hook Integration**: Uses MediaWiki's standard `AlternateUserMailer` hook to intercept and route all outgoing emails.
+- **Hook Integration**: Uses MediaWiki's `UserMailerTransformMessage` and `AlternateUserMailer` hooks to intercept and route all outgoing emails.
 - **Problem Details Handling**: Parses RFC 9457 Problem Details responses from the Mail API server for clear error reporting.
 
 ## Installation
@@ -55,12 +55,13 @@ $wgMailAPIToken = getenv( 'MAILAPI_TOKEN' ) ?: ''; // provider-issued secret tok
 | Variable | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `$wgMailAPIEndpoint` | `string` | `""` | The base URL or full endpoint URL (`/v1/messages`) of the Mail API service. |
-
 | `$wgMailAPIToken` | `string` | `""` | Provider-issued bearer token. Required by resend-mailer v0.3.0. Empty omits Authorization for providers using a deployment-specific equivalent scheme. |
+
+| `$wgMailAPIWaitTimeout` | `int` | `10` | Prefer waiting for completion for 0–20 seconds; 0 disables waiting. |
 
 ## How It Works
 
-1. **Email Interception**: Listens to the `AlternateUserMailer` hook called by `UserMailer::send()`.
+1. **Email Interception**: Submits from `UserMailerTransformMessage`, then uses `AlternateUserMailer` to skip the default transport called by `UserMailer::send()`.
 2. **Payload Construction**: Formats the sender, recipient(s), subject, text/html content, and supplemental headers into the Mail API `OutboundMessageRequest` schema:
    - `from`: `{ "email": "...", "name": "..." }`
    - `to`: `[ { "email": "...", "name": "..." } ]`
@@ -73,7 +74,7 @@ $wgMailAPIToken = getenv( 'MAILAPI_TOKEN' ) ?: ''; // provider-issued secret tok
 
 ## Upgrading from v0.1.x
 
-Configure `$wgMailAPIToken` before connecting to resend-mailer v0.3.0. Both HTTP `200` and `202` are successful submission responses. A configured provider failure now stops mail submission instead of silently trying the default transport; inspect the `mailapi` log when MediaWiki reports a mail error. The client does not automatically retry failed submissions.
+Configure `$wgMailAPIToken` before connecting to resend-mailer v0.3.0. Both HTTP `200` and `202` are successful submission responses. A configured provider failure now stops mail submission instead of silently trying the default transport; inspect the `mailapi` log when MediaWiki reports a mail error. The client retries transport failures, HTTP 429/503, and in-progress idempotency conflicts up to twice with the same key and body, within a 30-second budget. Terminal failures are reported through the transform hook error parameter with a boolean return, as required by MediaWiki. Retry-After values above two seconds are reported rather than retried early. A 202 response still means acceptance only. Direct Client callers may pass a stable key to `send($payload, $key)` for retries across calls; MediaWiki job-level retries do not automatically share that key.
 
 ## Testing
 

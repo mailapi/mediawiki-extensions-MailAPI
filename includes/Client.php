@@ -16,19 +16,28 @@ class Client
     /** @var string */
     private $token;
 
+    private $waitTimeout;
+    private $lastStatus = 0;
+    private $retryAfter = null;
+    private $lastProblemType = '';
+
     /**
      * @param string $endpoint
      * @param mixed|null $httpRequestFactory
      * @throws MWException
      */
-    public function __construct(string $endpoint, $httpRequestFactory = null, string $token = '')
+    public function __construct(string $endpoint, $httpRequestFactory = null, string $token = '', int $waitTimeout = 10)
     {
         $this->endpoint = self::normalizeEndpoint($endpoint);
         $this->httpRequestFactory = $httpRequestFactory;
         if ($token !== '' && !preg_match('/^[\x21-\x7E]+$/D', $token)) {
             throw new MWException('Mail API token must contain only visible ASCII characters.');
         }
+        if ($waitTimeout < 0 || $waitTimeout > 20) {
+            throw new MWException('Mail API wait timeout must be between 0 and 20 seconds.');
+        }
         $this->token = $token;
+        $this->waitTimeout = $waitTimeout;
     }
 
     /**
@@ -447,6 +456,7 @@ class Client
      */
     private function parseSuccessResponse(int $statusCode, string $responseBody): array
     {
+        $this->lastStatus = $statusCode;
         if ($statusCode !== 200 && $statusCode !== 202) {
             $this->handleErrorResponse($statusCode, $responseBody);
         }
@@ -466,19 +476,72 @@ class Client
      * Send OutboundMessageRequest to Mail API endpoint.
      *
      * @param array $payload
+     * @param string|null $idempotencyKey Stable key for retries of the same logical message
      * @return array
      * @throws MWException
      */
-    public function send(array $payload): array
+    public function send(array $payload, ?string $idempotencyKey = null): array
     {
         $json = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         if ($json === false) {
             throw new MWException('Failed to encode message payload as JSON: ' . json_last_error_msg());
         }
 
-        $requestHeaders = ['Idempotency-Key' => bin2hex(random_bytes(16))];
-        if ($this->token !== '') { $requestHeaders['Authorization'] = 'Bearer ' . $this->token; }
+        $key = $idempotencyKey ?? bin2hex(random_bytes(16));
+        if (strlen($key) < 1 || strlen($key) > 256 || !preg_match('/^[\x21-\x7E]+$/D', $key)) {
+            throw new MWException('Invalid Mail API Idempotency-Key.');
+        }
+        $headers = ['Idempotency-Key' => $key];
+        if ($this->token !== '') {
+            $headers['Authorization'] = 'Bearer ' . $this->token;
+        }
+        $deadline = microtime(true) + 30;
+        for ($attempt = 0; ; $attempt++) {
+            $this->lastStatus = 0;
+            $this->retryAfter = null;
+            $this->lastProblemType = '';
+            $remaining = $deadline - microtime(true);
+            $timeout = min($remaining, max(5, $this->waitTimeout + 2));
+            $requestHeaders = $headers;
+            if ($this->waitTimeout > 0) {
+                $requestHeaders['Prefer'] = 'wait=' . min($this->waitTimeout, max(0, (int)$timeout - 2));
+            }
+            try {
+                return $this->sendOnce($json, $requestHeaders, $timeout);
+            } catch (MWException $e) {
+                $retryable = in_array($this->lastStatus, [0, 429, 503], true) ||
+                    ($this->lastStatus === 409 && $this->lastProblemType ===
+                        'https://mailapi.github.io/problems/idempotency-key-in-progress');
+                $delay = $this->retryDelay();
+                if (!$retryable || $attempt >= 2 || $delay === null ||
+                    microtime(true) + $delay + 1 >= $deadline) {
+                    throw $e;
+                }
+                usleep((int)($delay * 1000000));
+            }
+        }
+    }
 
+    private function retryDelay(): ?float
+    {
+        if ($this->retryAfter === null || $this->retryAfter === '') {
+            return 0.1;
+        }
+        if (ctype_digit($this->retryAfter)) {
+            $delay = (float)$this->retryAfter;
+        } else {
+            $timestamp = strtotime($this->retryAfter);
+            if ($timestamp === false) {
+                return null;
+            }
+            $delay = max(0, $timestamp - time());
+        }
+        // A long Retry-After is reported rather than retried prematurely.
+        return $delay <= 2 ? $delay : null;
+    }
+
+    private function sendOnce(string $json, array $requestHeaders, float $timeout): array
+    {
         $httpFactory = $this->httpRequestFactory;
         if ($httpFactory === null && class_exists(MediaWikiServices::class)) {
             $httpFactory = MediaWikiServices::getInstance()->getHttpRequestFactory();
@@ -490,17 +553,23 @@ class Client
                 [
                     'method' => 'POST',
                     'postData' => $json,
-                    'timeout' => 30,
+                    'timeout' => $timeout,
                 ],
                 __METHOD__
             );
             $req->setHeader('Content-Type', 'application/json');
             $req->setHeader('Accept', 'application/json, application/problem+json');
-            foreach ($requestHeaders as $name => $value) { $req->setHeader($name, $value); }
+            foreach ($requestHeaders as $name => $value) {
+                $req->setHeader($name, $value);
+            }
 
             $status = $req->execute();
             $statusCode = (int)$req->getStatus();
             $responseBody = (string)$req->getContent();
+            $this->lastStatus = $statusCode;
+            if (method_exists($req, 'getResponseHeader')) {
+                $this->retryAfter = $req->getResponseHeader('Retry-After') ?: null;
+            }
 
             if ($status->isOK() && ($statusCode === 200 || $statusCode === 202)) {
                 return $this->parseSuccessResponse($statusCode, $responseBody);
@@ -510,7 +579,7 @@ class Client
             $this->handleErrorResponse($statusCode, $responseBody, $wikiText);
         }
 
-        return $this->sendViaNativeHttp($json, $requestHeaders);
+        return $this->sendViaNativeHttp($json, $requestHeaders, $timeout);
     }
 
     /**
@@ -522,7 +591,9 @@ class Client
      */
     private function handleErrorResponse(int $statusCode, string $responseBody, string $fallbackError = ''): void
     {
+        $this->lastStatus = $statusCode;
         $problem = json_decode($responseBody, true);
+        $this->lastProblemType = is_array($problem) ? (string)($problem['type'] ?? '') : '';
         if (is_array($problem)) {
             $title = $problem['title'] ?? '';
             $detail = $problem['detail'] ?? '';
@@ -555,10 +626,12 @@ class Client
      * @return array
      * @throws MWException
      */
-    private function sendViaNativeHttp(string $json, array $requestHeaders): array
+    private function sendViaNativeHttp(string $json, array $requestHeaders, float $timeout): array
     {
         $headers = ['Content-Type: application/json', 'Accept: application/json, application/problem+json'];
-        foreach ($requestHeaders as $name => $value) { $headers[] = $name . ': ' . $value; }
+        foreach ($requestHeaders as $name => $value) {
+            $headers[] = $name . ': ' . $value;
+        }
 
         if (function_exists('curl_init')) {
             $ch = curl_init($this->endpoint);
@@ -567,7 +640,13 @@ class Client
                 CURLOPT_POSTFIELDS => $json,
                 CURLOPT_HTTPHEADER => $headers,
                 CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_TIMEOUT => 30,
+                CURLOPT_TIMEOUT_MS => max(1, (int)($timeout * 1000)),
+                CURLOPT_HEADERFUNCTION => function ($ch, $line) {
+                    if (stripos($line, 'Retry-After:') === 0) {
+                        $this->retryAfter = trim(substr($line, 12));
+                    }
+                    return strlen($line);
+                },
             ]);
 
             $responseBody = curl_exec($ch);
@@ -587,14 +666,24 @@ class Client
                 'method' => 'POST',
                 'header' => implode("\r\n", $headers) . "\r\n",
                 'content' => $json,
-                'timeout' => 30,
+                'timeout' => $timeout,
                 'ignore_errors' => true,
             ],
         ]);
 
+        error_clear_last();
         $responseBody = @file_get_contents($this->endpoint, false, $context);
+        if ($responseBody === false) {
+            $cause = error_get_last()['message'] ?? 'Unknown stream error';
+            throw new MWException('Mail API stream error: ' . $cause);
+        }
         $statusCode = 0;
         if (isset($http_response_header) && is_array($http_response_header)) {
+            foreach ($http_response_header as $line) {
+                if (stripos($line, 'Retry-After:') === 0) {
+                    $this->retryAfter = trim(substr($line, 12));
+                }
+            }
             if (preg_match('#HTTP/\S+\s+(\d+)#', $http_response_header[0], $matches)) {
                 $statusCode = (int)$matches[1];
             }

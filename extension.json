@@ -20,7 +20,8 @@
 		}
 	},
 	"Hooks": {
-		"AlternateUserMailer": "MailAPIHooks"
+		"AlternateUserMailer": "MailAPIHooks",
+		"UserMailerTransformMessage": "MailAPIHooks"
 	},
 	"config": {
 		"MailAPIEndpoint": {
@@ -30,6 +31,10 @@
 		"MailAPIToken": {
 			"value": "",
 			"description": "Provider-issued bearer token for the Mail API service; keep this secret."
+		},
+		"MailAPIWaitTimeout": {
+			"value": 10,
+			"description": "Prefer: wait seconds (0\u201320), within the total 30-second submission deadline."
 		}
 	},
 	"manifest_version": 2

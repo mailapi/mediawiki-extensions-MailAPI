@@ -4,11 +4,12 @@ namespace MediaWiki\Extension\MailAPI;
 
 use MailAddress;
 use MediaWiki\Hook\AlternateUserMailerHook;
+use MediaWiki\Hook\UserMailerTransformMessageHook;
 use MediaWiki\Logger\LoggerFactory;
 use MediaWiki\MediaWikiServices;
 use Throwable;
 
-class Hooks implements AlternateUserMailerHook
+class Hooks implements AlternateUserMailerHook, UserMailerTransformMessageHook
 {
     /** @var object|null */
     private $logger;
@@ -22,60 +23,61 @@ class Hooks implements AlternateUserMailerHook
     }
 
     /**
-     * Send MediaWiki mail through Mail API.
-     *
-     * @param array|string $headers
-     * @param MailAddress[]|MailAddress $to
-     * @param MailAddress $from
-     * @param string $subject
-     * @param string|array $body
-     * @return bool|string False on acceptance; true when not configured; an error
-     *   string on failure, preventing an unsafe second submission via SMTP.
+     * Dispatch through the abortable transform hook, whose error argument is
+     * converted to a fatal Status by UserMailer. Hook returns remain boolean.
      */
-    public function onAlternateUserMailer($headers, $to, $from, $subject, $body)
+    public function onUserMailerTransformMessage($to, $from, &$subject, &$headers, &$body, &$error)
     {
-        global $wgMailAPIEndpoint, $wgMailAPIToken;
-        $token = (string)($wgMailAPIToken ?? '');
-
-        $endpoint = (string)$wgMailAPIEndpoint;
-        if (class_exists(MediaWikiServices::class)) {
-            $config = MediaWikiServices::getInstance()->getMainConfig();
-            if ($token === '' && $config->has('MailAPIToken')) { $token = (string)$config->get('MailAPIToken'); }
-            if ($endpoint === '' && $config->has('MailAPIEndpoint')) {
-                $endpoint = (string)$config->get('MailAPIEndpoint');
-            }
-        }
-
+        [$endpoint, $token, $waitTimeout] = $this->settings();
         if ($endpoint === '') {
-            $this->log(
-                'error',
-                'MailAPI endpoint is not configured; falling back to the default mailer.'
-            );
             return true;
         }
-
+        if ($token === '') {
+            $this->log('warning', 'MailAPI endpoint is configured without a bearer token.');
+        }
         try {
-            $client = new Client($endpoint, null, $token);
+            $client = new Client($endpoint, null, $token, $waitTimeout);
             $payload = $client->buildPayload($headers, $to, $from, $subject, $body);
             $response = $client->send($payload);
             $this->log(
                 'info',
                 'MailAPI accepted email for processing. Message ID: {message_id}',
-                ['message_id' => $response['id'] ?? '(missing)']
+                ['message_id' => $response['id']]
             );
-
-            return false;
+            return true;
         } catch (Throwable $e) {
-            $this->log(
-                'error',
-                'MailAPI submission failed: {error}',
-                [
-                    'error' => $e->getMessage(),
-                    'exception' => $e,
-                ]
-            );
-            return 'Mail API submission failed: ' . $e->getMessage();
+            $error = 'Mail API submission failed: ' . $e->getMessage();
+            $this->log('error', 'MailAPI submission failed: {error}', ['error' => $e->getMessage()]);
+            return false;
         }
+    }
+
+    /** @return bool Skip SMTP only when Mail API is configured. */
+    public function onAlternateUserMailer($headers, $to, $from, $subject, $body)
+    {
+        [$endpoint] = $this->settings();
+        return $endpoint === '';
+    }
+
+    private function settings(): array
+    {
+        global $wgMailAPIEndpoint, $wgMailAPIToken, $wgMailAPIWaitTimeout;
+        $endpoint = (string)($wgMailAPIEndpoint ?? '');
+        $token = (string)($wgMailAPIToken ?? '');
+        $waitTimeout = (int)($wgMailAPIWaitTimeout ?? 10);
+        if (class_exists(MediaWikiServices::class)) {
+            $config = MediaWikiServices::getInstance()->getMainConfig();
+            if ($endpoint === '' && $config->has('MailAPIEndpoint')) {
+                $endpoint = (string)$config->get('MailAPIEndpoint');
+            }
+            if ($token === '' && $config->has('MailAPIToken')) {
+                $token = (string)$config->get('MailAPIToken');
+            }
+            if (!isset($wgMailAPIWaitTimeout) && $config->has('MailAPIWaitTimeout')) {
+                $waitTimeout = (int)$config->get('MailAPIWaitTimeout');
+            }
+        }
+        return [$endpoint, $token, $waitTimeout];
     }
 
     /**

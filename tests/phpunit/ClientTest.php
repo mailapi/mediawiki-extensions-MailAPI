@@ -544,6 +544,96 @@ EOM;
         $this->assertGreaterThanOrEqual(1.9, microtime(true) - $started);
     }
 
+    /**
+     * @param array $responses List of [status, body, wikiText] per attempt; the last one repeats
+     */
+    private function sequenceFactory(array $responses)
+    {
+        return new class($responses) {
+            public int $calls = 0;
+            private array $responses;
+            public function __construct($responses) { $this->responses = $responses; }
+            public function create($url, $options, $caller) {
+                [$status, $body, $wikiText] = $this->responses[min($this->calls, count($this->responses) - 1)];
+                $this->calls++;
+                return new class($status, $body, $wikiText) {
+                    private $status;
+                    private $body;
+                    private $wikiText;
+                    public function __construct($status, $body, $wikiText) {
+                        $this->status = $status;
+                        $this->body = $body;
+                        $this->wikiText = $wikiText;
+                    }
+                    public function setHeader($name, $value) {}
+                    public function execute() {
+                        return new class($this->wikiText) {
+                            private $wikiText;
+                            public function __construct($wikiText) { $this->wikiText = $wikiText; }
+                            public function isOK() { return false; }
+                            public function getWikiText() { return $this->wikiText; }
+                        };
+                    }
+                    public function getStatus() { return $this->status; }
+                    public function getResponseHeader($name) { return null; }
+                    public function getContent() { return $this->body; }
+                };
+            }
+        };
+    }
+
+    public function testAmbiguousTransportFailureReportsUnknownOutcome(): void
+    {
+        $factory = $this->sequenceFactory([[0, '', 'Error fetching URL: Operation timed out after 12001 milliseconds']]);
+        $this->expectException(\MediaWiki\Extension\MailAPI\OutcomeUnknownException::class);
+        try {
+            (new Client('http://localhost:8080', $factory))->send(['text' => 'Hello']);
+        } finally {
+            $this->assertSame(3, $factory->calls);
+        }
+    }
+
+    public function testConnectionFailureIsReportedAsKnownFailure(): void
+    {
+        $factory = $this->sequenceFactory([
+            [0, '', 'Error fetching URL: Failed to connect to localhost port 8080 after 0 ms: Couldn\'t connect to server'],
+        ]);
+        try {
+            (new Client('http://localhost:8080', $factory))->send(['text' => 'Hello']);
+            $this->fail('Expected a failure');
+        } catch (MWException $e) {
+            $this->assertNotInstanceOf(\MediaWiki\Extension\MailAPI\OutcomeUnknownException::class, $e);
+        }
+        $this->assertSame(3, $factory->calls);
+    }
+
+    public function testTerminalReplayAfterTimeoutIsReportedAsKnownFailure(): void
+    {
+        $factory = $this->sequenceFactory([
+            [0, '', 'Error fetching URL: Operation timed out'],
+            [500, '{"type":"https://mailapi.github.io/problems/provider-error","title":"Provider error"}', ''],
+        ]);
+        try {
+            (new Client('http://localhost:8080', $factory))->send(['text' => 'Hello']);
+            $this->fail('Expected a failure');
+        } catch (MWException $e) {
+            $this->assertNotInstanceOf(\MediaWiki\Extension\MailAPI\OutcomeUnknownException::class, $e);
+            $this->assertStringContainsString('HTTP 500', $e->getMessage());
+        }
+        $this->assertSame(2, $factory->calls);
+    }
+
+    public function testAdmissionRejectionAfterTimeoutKeepsUnknownOutcome(): void
+    {
+        // A 429 is decided before the key lookup, so it says nothing about the earlier attempt.
+        $factory = $this->sequenceFactory([
+            [0, '', 'Error fetching URL: Operation timed out'],
+            [429, '{"type":"https://mailapi.github.io/problems/rate-limit-exceeded","title":"Rate limit exceeded"}', ''],
+        ]);
+        $this->expectException(\MediaWiki\Extension\MailAPI\OutcomeUnknownException::class);
+        (new Client('http://localhost:8080', $factory))->send(['text' => 'Hello']);
+    }
+
     public function testLongRetryAfterIsNotRetriedEarly(): void
     {
         $factory = new class {

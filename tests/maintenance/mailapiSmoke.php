@@ -38,7 +38,8 @@ class MailAPISmoke extends Maintenance
                     $this->fatal('Expected fatal php-mail-error for ' . $scenario);
                 }
                 $detail = $errors[0]['params'][0] ?? '';
-                $expected = $scenario === 'terminal' ? 'submission failed' : 'outcome is unknown';
+                // A refused connection never reached the provider, so its failure is known.
+                $expected = $scenario === 'pending' ? 'outcome is unknown' : 'submission failed';
                 if (!str_contains($detail, $expected) || str_contains($detail, 'private-provider-detail')) {
                     $this->fatal('Unexpected user-facing error for ' . $scenario);
                 }

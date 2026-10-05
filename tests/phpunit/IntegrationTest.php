@@ -146,6 +146,17 @@ PHP;
             'Hello from Hook'
         );
 
+        $subject = 'MediaWiki Test';
+        $headers = [];
+        $body = 'Hello from Hook';
+        $error = null;
+        $this->assertTrue($hooks->onUserMailerTransformMessage(
+            new MailAddress('user@example.com'), new MailAddress('wiki@example.com'),
+            $subject, $headers, $body, $error
+        ));
+        $this->assertNull($error);
+        $this->assertSame('MediaWiki Test', json_decode(file_get_contents(self::$lastRequestFile), true)['subject']);
+
         // onAlternateUserMailer returns false when email delivery is successfully intercepted
         $this->assertFalse($ret);
     }
@@ -165,8 +176,17 @@ PHP;
             'Hello from Hook'
         );
 
-        // An ambiguous failure must not submit the same message through SMTP.
-        $this->assertIsString($ret);
-        $this->assertStringContainsString('Mail API submission failed', $ret);
+        $subject = 'MediaWiki Test';
+        $headers = [];
+        $body = 'Hello from Hook';
+        $error = null;
+        $result = $hooks->onUserMailerTransformMessage(
+            new MailAddress('user@example.com'),
+            new MailAddress('wiki@example.com'),
+            $subject, $headers, $body, $error
+        );
+        $this->assertFalse($result);
+        $this->assertFalse($ret);
+        $this->assertSame('Mail API submission failed. Please contact the wiki administrator.', $error);
     }
 }

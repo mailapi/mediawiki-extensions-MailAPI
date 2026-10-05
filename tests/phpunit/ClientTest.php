@@ -448,4 +448,206 @@ EOM;
         $this->assertSame([['email' => 'one@example.com'], ['email' => 'two@example.com']], $payload['cc']);
     }
 
+    public function testRetriesKeepIdenticalPayloadAndKey(): void
+    {
+        foreach ([429, 503] as $initialStatus) {
+            $factory = new class($initialStatus) {
+                public array $requests = [];
+                private int $initialStatus;
+                public function __construct($status) { $this->initialStatus = $status; }
+                public function create($url, $options, $caller) {
+                    $status = count($this->requests) === 0 ? $this->initialStatus : 200;
+                    $request = new class($status, $options) {
+                        public array $headers = [];
+                        public array $options;
+                        private int $status;
+                        public function __construct($status, $options) { $this->status = $status; $this->options = $options; }
+                        public function setHeader($name, $value) { $this->headers[$name] = $value; }
+                        public function execute() { return new class { public function isOK() { return true; } }; }
+                        public function getStatus() { return $this->status; }
+                        public function getResponseHeader($name) { return '0'; }
+                        public function getContent() {
+                            return $this->status === 200 ? '{"id":"done"}' : '{"title":"Retry"}';
+                        }
+                    };
+                    $this->requests[] = $request;
+                    return $request;
+                }
+            };
+            $client = new Client('http://localhost:8080', $factory, 'token');
+            $this->assertSame(['id' => 'done'], $client->send(['text' => 'Hello'], 'logical-message-1'));
+            $this->assertCount(2, $factory->requests);
+            $this->assertEqualsWithDelta(5, $factory->requests[0]->options['timeout'], 0.01);
+            $this->assertSame($factory->requests[0]->options['postData'], $factory->requests[1]->options['postData']);
+            foreach ($factory->requests as $request) {
+                $this->assertSame('logical-message-1', $request->headers['Idempotency-Key']);
+                // Hand off without waiting for dispatch by default.
+                $this->assertArrayNotHasKey('Prefer', $request->headers);
+                $this->assertLessThanOrEqual(5, $request->options['timeout']);
+            }
+        }
+    }
+
+    public function testTerminalFailureIsNeverRetried(): void
+    {
+        $factory = new class {
+            public int $calls = 0;
+            public function create($url, $options, $caller) {
+                $this->calls++;
+                return new class {
+                    public function setHeader($name, $value) {}
+                    public function execute() { return new class { public function isOK() { return false; } }; }
+                    public function getStatus() { return 500; }
+                    public function getContent() { return '{"title":"Terminal failure"}'; }
+                };
+            }
+        };
+        try {
+            (new Client('http://localhost:8080', $factory))->send(['text' => 'Hello']);
+            $this->fail('Expected a terminal failure');
+        } catch (MWException $e) {
+            $this->assertStringContainsString('HTTP 500', $e->getMessage());
+        }
+        $this->assertSame(1, $factory->calls);
+    }
+
+    public function testInProgressIsNotRetriedAndReportsUnknownOutcome(): void
+    {
+        $factory = $this->sequenceFactory([
+            [409, '{"type":"https://mailapi.github.io/problems/idempotency-key-in-progress"}', ''],
+        ]);
+        try {
+            (new Client('http://localhost:8080', $factory))->send(['text' => 'Hello'], 'stable-key');
+            $this->fail('Expected an unknown outcome');
+        } catch (\MediaWiki\Extension\MailAPI\OutcomeUnknownException $e) {
+            $this->assertStringContainsString('may still be sent', $e->getMessage());
+            $this->assertInstanceOf(MWException::class, $e->getPrevious());
+        }
+        $this->assertSame(1, $factory->calls);
+    }
+
+    public function testPreferWaitWhenConfigured(): void
+    {
+        $factory = new class {
+            public array $requests = [];
+            public function create($url, $options, $caller) {
+                $request = new class($options) {
+                    public array $headers = [];
+                    public array $options;
+                    public function __construct($options) { $this->options = $options; }
+                    public function setHeader($name, $value) { $this->headers[$name] = $value; }
+                    public function execute() { return new class { public function isOK() { return true; } }; }
+                    public function getStatus() { return 200; }
+                    public function getContent() { return '{"id":"done"}'; }
+                };
+                $this->requests[] = $request;
+                return $request;
+            }
+        };
+        (new Client('http://localhost:8080', $factory, '', 10))->send(['text' => 'Hello']);
+        $this->assertSame('wait=10', $factory->requests[0]->headers['Prefer']);
+        $this->assertEqualsWithDelta(12, $factory->requests[0]->options['timeout'], 0.01);
+    }
+
+    /**
+     * @param array $responses List of [status, body, wikiText] per attempt; the last one repeats
+     */
+    private function sequenceFactory(array $responses)
+    {
+        return new class($responses) {
+            public int $calls = 0;
+            private array $responses;
+            public function __construct($responses) { $this->responses = $responses; }
+            public function create($url, $options, $caller) {
+                [$status, $body, $wikiText] = $this->responses[min($this->calls, count($this->responses) - 1)];
+                $this->calls++;
+                return new class($status, $body, $wikiText) {
+                    private $status;
+                    private $body;
+                    private $wikiText;
+                    public function __construct($status, $body, $wikiText) {
+                        $this->status = $status;
+                        $this->body = $body;
+                        $this->wikiText = $wikiText;
+                    }
+                    public function setHeader($name, $value) {}
+                    public function execute() {
+                        return new class($this->wikiText) {
+                            private $wikiText;
+                            public function __construct($wikiText) { $this->wikiText = $wikiText; }
+                            public function isOK() { return false; }
+                            public function getWikiText() { return $this->wikiText; }
+                        };
+                    }
+                    public function getStatus() { return $this->status; }
+                    public function getResponseHeader($name) { return null; }
+                    public function getContent() { return $this->body; }
+                };
+            }
+        };
+    }
+
+    public function testTimeoutIsNotRetriedAndReportsUnknownOutcome(): void
+    {
+        $factory = $this->sequenceFactory([[0, '', 'Error fetching URL: Operation timed out after 5001 milliseconds']]);
+        $this->expectException(\MediaWiki\Extension\MailAPI\OutcomeUnknownException::class);
+        try {
+            (new Client('http://localhost:8080', $factory))->send(['text' => 'Hello']);
+        } finally {
+            $this->assertSame(1, $factory->calls);
+        }
+    }
+
+    public function testConnectionFailureIsReportedAsKnownFailure(): void
+    {
+        $factory = $this->sequenceFactory([
+            [0, '', 'Error fetching URL: Failed to connect to localhost port 8080 after 0 ms: Couldn\'t connect to server'],
+        ]);
+        try {
+            (new Client('http://localhost:8080', $factory))->send(['text' => 'Hello']);
+            $this->fail('Expected a failure');
+        } catch (MWException $e) {
+            $this->assertNotInstanceOf(\MediaWiki\Extension\MailAPI\OutcomeUnknownException::class, $e);
+        }
+        $this->assertSame(3, $factory->calls);
+    }
+
+    public function testTimeoutAfterCertainRejectionReportsUnknownOutcome(): void
+    {
+        $factory = $this->sequenceFactory([
+            [429, '{"type":"https://mailapi.github.io/problems/rate-limit-exceeded","title":"Rate limit exceeded"}', ''],
+            [0, '', 'Error fetching URL: Operation timed out'],
+        ]);
+        $this->expectException(\MediaWiki\Extension\MailAPI\OutcomeUnknownException::class);
+        try {
+            (new Client('http://localhost:8080', $factory))->send(['text' => 'Hello']);
+        } finally {
+            $this->assertSame(2, $factory->calls);
+        }
+    }
+
+    public function testLongRetryAfterIsNotRetriedEarly(): void
+    {
+        $factory = new class {
+            public int $calls = 0;
+            public function create($url, $options, $caller) {
+                $this->calls++;
+                return new class {
+                    public function setHeader($name, $value) {}
+                    public function execute() { return new class { public function isOK() { return false; } }; }
+                    public function getStatus() { return 429; }
+                    public function getResponseHeader($name) { return '30'; }
+                    public function getContent() { return '{"title":"Rate limited"}'; }
+                };
+            }
+        };
+        try {
+            (new Client('http://localhost:8080', $factory))->send(['text' => 'Hello']);
+            $this->fail('Expected rejection');
+        } catch (MWException $e) {
+            $this->assertStringContainsString('HTTP 429', $e->getMessage());
+        }
+        $this->assertSame(1, $factory->calls);
+    }
+
 }

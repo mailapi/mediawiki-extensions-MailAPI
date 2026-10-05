@@ -1,6 +1,6 @@
 {
 	"name": "MailAPI",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"author": [
 		"jmnote"
 	],
@@ -20,7 +20,8 @@
 		}
 	},
 	"Hooks": {
-		"AlternateUserMailer": "MailAPIHooks"
+		"AlternateUserMailer": "MailAPIHooks",
+		"UserMailerTransformMessage": "MailAPIHooks"
 	},
 	"config": {
 		"MailAPIEndpoint": {
@@ -30,6 +31,10 @@
 		"MailAPIToken": {
 			"value": "",
 			"description": "Provider-issued bearer token for the Mail API service; keep this secret."
+		},
+		"MailAPIWaitTimeout": {
+			"value": 0,
+			"description": "Prefer: wait seconds (0\u201320). 0 hands off without waiting for provider dispatch."
 		}
 	},
 	"manifest_version": 2

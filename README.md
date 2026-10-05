@@ -6,7 +6,7 @@ MediaWiki extension that sends emails through an external service conforming to 
 
 - **Mail API Compliant**: Targets v0.4.4 of the vendor-neutral [Mail API OpenAPI Specification](https://github.com/mailapi/mailapi/blob/v0.4.4/openapi.yaml).
 - **Simple Configuration**: Uses `$wgMailAPIEndpoint` and `$wgMailAPIToken` for bearer-authenticated providers.
-- **Hook Integration**: Uses MediaWiki's standard `AlternateUserMailer` hook to intercept and route all outgoing emails.
+- **Hook Integration**: Uses MediaWiki's `UserMailerTransformMessage` and `AlternateUserMailer` hooks to intercept and route all outgoing emails.
 - **Problem Details Handling**: Parses RFC 9457 Problem Details responses from the Mail API server for clear error reporting.
 
 ## Installation
@@ -55,12 +55,12 @@ $wgMailAPIToken = getenv( 'MAILAPI_TOKEN' ) ?: ''; // provider-issued secret tok
 | Variable | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `$wgMailAPIEndpoint` | `string` | `""` | The base URL or full endpoint URL (`/v1/messages`) of the Mail API service. |
-
 | `$wgMailAPIToken` | `string` | `""` | Provider-issued bearer token. Required by resend-mailer v0.3.0. Empty omits Authorization for providers using a deployment-specific equivalent scheme. |
+| `$wgMailAPIWaitTimeout` | `int` | `0` | Seconds (0–20) to ask the provider to wait for dispatch with `Prefer: wait`. `0` hands off on `202` without waiting, like an MTA accepting a message. |
 
 ## How It Works
 
-1. **Email Interception**: Listens to the `AlternateUserMailer` hook called by `UserMailer::send()`.
+1. **Email Interception**: Submits from `UserMailerTransformMessage`, then uses `AlternateUserMailer` to skip the default transport called by `UserMailer::send()`.
 2. **Payload Construction**: Formats the sender, recipient(s), subject, text/html content, and supplemental headers into the Mail API `OutboundMessageRequest` schema:
    - `from`: `{ "email": "...", "name": "..." }`
    - `to`: `[ { "email": "...", "name": "..." } ]`
@@ -73,7 +73,7 @@ $wgMailAPIToken = getenv( 'MAILAPI_TOKEN' ) ?: ''; // provider-issued secret tok
 
 ## Upgrading from v0.1.x
 
-Configure `$wgMailAPIToken` before connecting to resend-mailer v0.3.0. Both HTTP `200` and `202` are successful submission responses. A configured provider failure now stops mail submission instead of silently trying the default transport; inspect the `mailapi` log when MediaWiki reports a mail error. The client does not automatically retry failed submissions.
+Configure `$wgMailAPIToken` before connecting to resend-mailer v0.3.0. Both HTTP `200` and `202` are successful submission responses. A configured provider failure now stops mail submission instead of silently trying the default transport; inspect the `mailapi` log when MediaWiki reports a mail error. The client hands off quickly: each attempt waits 5 seconds for acceptance (or `$wgMailAPIWaitTimeout` plus 2 seconds when waiting is enabled), and only rejections that certainly did not start the submission (HTTP 429/503, DNS failure, refused connection) are retried, up to twice with the same key and body and within 5 extra seconds. Failures after acceptance are the provider's responsibility and appear in its logs, not in MediaWiki. Terminal failures are reported through the transform hook error parameter with a boolean return, as required by MediaWiki. Retry-After values above two seconds are reported rather than retried early. A 202 response still means acceptance only. Direct Client callers may pass a stable key to `send($payload, $key)` for retries across calls; MediaWiki job-level retries do not automatically share that key.
 
 ## Testing
 
@@ -84,6 +84,22 @@ composer install
 ./vendor/bin/phpunit
 ```
 
+For a disposable installed MediaWiki instance with this extension loaded, start the local-only mock router and run the real hook smoke test:
+
+```bash
+php -S 127.0.0.1:8099 extensions/MailAPI/tests/maintenance/smokeRouter.php
+# In another shell, from the MediaWiki installation directory:
+php extensions/MailAPI/tests/maintenance/mailapiSmoke.php --endpoint http://127.0.0.1:8099
+```
+
+This checks success, terminal failure, in-progress exhaustion, and transport failure through `UserMailer::send()` and the real HookContainer without sending email.
+
 ## License
 
 [Apache License 2.0](LICENSE)
+
+## Hook ordering and uncertain outcomes
+
+MailAPI submits during `UserMailerTransformMessage`. Register other message-transforming or aborting handlers before MailAPI; handlers that run afterwards cannot change the submitted message or undo it. This must be checked when installing other mail-related extensions.
+
+A timeout or other ambiguous transport failure, or an in-progress conflict, is not retried: MediaWiki reports an unknown outcome because the message may still be sent, so do not immediately submit it again with a new key. Other failures are reported as known. Detailed errors and exception traces are logged rather than shown to users. Out-of-range `MailAPIWaitTimeout` settings log a warning and disable waiting.

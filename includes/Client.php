@@ -13,15 +13,22 @@ class Client
     /** @var mixed|null */
     private $httpRequestFactory;
 
+    /** @var string */
+    private $token;
+
     /**
      * @param string $endpoint
      * @param mixed|null $httpRequestFactory
      * @throws MWException
      */
-    public function __construct(string $endpoint, $httpRequestFactory = null)
+    public function __construct(string $endpoint, $httpRequestFactory = null, string $token = '')
     {
         $this->endpoint = self::normalizeEndpoint($endpoint);
         $this->httpRequestFactory = $httpRequestFactory;
+        if ($token !== '' && !preg_match('/^[\x21-\x7E]+$/D', $token)) {
+            throw new MWException('Mail API token must contain only visible ASCII characters.');
+        }
+        $this->token = $token;
     }
 
     /**
@@ -217,10 +224,10 @@ class Client
         $html = null;
 
         if (is_array($body)) {
-            if (isset($body['text']) && (string)$body['text'] !== '') {
+            if (isset($body['text'])) {
                 $text = (string)$body['text'];
             }
-            if (isset($body['html']) && (string)$body['html'] !== '') {
+            if (isset($body['html'])) {
                 $html = (string)$body['html'];
             }
             if ($text === null && $html === null) {
@@ -371,10 +378,10 @@ class Client
 
         // Handle body content (including multipart/alternative MIME parsing)
         $bodyParts = self::parseBodyParts($body, $rawHeaders);
-        if ($bodyParts['text'] !== null && $bodyParts['text'] !== '') {
+        if ($bodyParts['text'] !== null) {
             $payload['text'] = $bodyParts['text'];
         }
-        if ($bodyParts['html'] !== null && $bodyParts['html'] !== '') {
+        if ($bodyParts['html'] !== null) {
             $payload['html'] = $bodyParts['html'];
         }
         if (!isset($payload['text']) && !isset($payload['html'])) {
@@ -401,17 +408,17 @@ class Client
                 if ($lower === 'reply-to') {
                     $replyTo = self::parseAddressList($headerValue, 'replyTo');
                     if (!empty($replyTo)) {
-                        $payload['replyTo'] = $replyTo;
+                        $payload['replyTo'] = array_merge($payload['replyTo'] ?? [], $replyTo);
                     }
                 } elseif ($lower === 'cc') {
                     $cc = self::parseAddressList($headerValue, 'cc');
                     if (!empty($cc)) {
-                        $payload['cc'] = $cc;
+                        $payload['cc'] = array_merge($payload['cc'] ?? [], $cc);
                     }
                 } elseif ($lower === 'bcc') {
                     $bcc = self::parseAddressList($headerValue, 'bcc');
                     if (!empty($bcc)) {
-                        $payload['bcc'] = $bcc;
+                        $payload['bcc'] = array_merge($payload['bcc'] ?? [], $bcc);
                     }
                 }
                 continue;
@@ -431,7 +438,7 @@ class Client
     }
 
     /**
-     * Validate and decode the Mail API HTTP 200 response according to OpenAPI schema.
+     * Validate and decode the Mail API HTTP 200 or 202 response according to OpenAPI schema.
      *
      * @param int $statusCode
      * @param string $responseBody
@@ -440,7 +447,7 @@ class Client
      */
     private function parseSuccessResponse(int $statusCode, string $responseBody): array
     {
-        if ($statusCode !== 200) {
+        if ($statusCode !== 200 && $statusCode !== 202) {
             $this->handleErrorResponse($statusCode, $responseBody);
         }
 
@@ -469,6 +476,9 @@ class Client
             throw new MWException('Failed to encode message payload as JSON: ' . json_last_error_msg());
         }
 
+        $requestHeaders = ['Idempotency-Key' => bin2hex(random_bytes(16))];
+        if ($this->token !== '') { $requestHeaders['Authorization'] = 'Bearer ' . $this->token; }
+
         $httpFactory = $this->httpRequestFactory;
         if ($httpFactory === null && class_exists(MediaWikiServices::class)) {
             $httpFactory = MediaWikiServices::getInstance()->getHttpRequestFactory();
@@ -486,12 +496,13 @@ class Client
             );
             $req->setHeader('Content-Type', 'application/json');
             $req->setHeader('Accept', 'application/json, application/problem+json');
+            foreach ($requestHeaders as $name => $value) { $req->setHeader($name, $value); }
 
             $status = $req->execute();
             $statusCode = (int)$req->getStatus();
             $responseBody = (string)$req->getContent();
 
-            if ($status->isOK() && $statusCode === 200) {
+            if ($status->isOK() && ($statusCode === 200 || $statusCode === 202)) {
                 return $this->parseSuccessResponse($statusCode, $responseBody);
             }
 
@@ -499,7 +510,7 @@ class Client
             $this->handleErrorResponse($statusCode, $responseBody, $wikiText);
         }
 
-        return $this->sendViaNativeHttp($json);
+        return $this->sendViaNativeHttp($json, $requestHeaders);
     }
 
     /**
@@ -544,17 +555,17 @@ class Client
      * @return array
      * @throws MWException
      */
-    private function sendViaNativeHttp(string $json): array
+    private function sendViaNativeHttp(string $json, array $requestHeaders): array
     {
+        $headers = ['Content-Type: application/json', 'Accept: application/json, application/problem+json'];
+        foreach ($requestHeaders as $name => $value) { $headers[] = $name . ': ' . $value; }
+
         if (function_exists('curl_init')) {
             $ch = curl_init($this->endpoint);
             curl_setopt_array($ch, [
                 CURLOPT_POST => true,
                 CURLOPT_POSTFIELDS => $json,
-                CURLOPT_HTTPHEADER => [
-                    'Content-Type' => 'application/json',
-                    'Accept' => 'application/json, application/problem+json',
-                ],
+                CURLOPT_HTTPHEADER => $headers,
                 CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_TIMEOUT => 30,
             ]);
@@ -574,7 +585,7 @@ class Client
         $context = stream_context_create([
             'http' => [
                 'method' => 'POST',
-                'header' => "Content-Type: application/json\r\nAccept: application/json, application/problem+json\r\n",
+                'header' => implode("\r\n", $headers) . "\r\n",
                 'content' => $json,
                 'timeout' => 30,
                 'ignore_errors' => true,

@@ -405,4 +405,47 @@ EOM;
         $this->expectExceptionMessage("Mail API response malformed (HTTP 200): expected JSON object with non-empty string 'id'.");
         $client->send($payload);
     }
+    public function testAcceptedResponseAndBearerHeaders(): void
+    {
+        $request = new class {
+            public $headers = [];
+            public function setHeader($name, $value) { $this->headers[$name] = $value; }
+            public function execute() { return new class { public function isOK() { return true; } }; }
+            public function getStatus() { return 202; }
+            public function getContent() { return '{"id":"queued-message"}'; }
+        };
+        $factory = new class($request) {
+            private $request;
+            public function __construct($request) { $this->request = $request; }
+            public function create($url, $options, $caller) { return $this->request; }
+        };
+        $client = new Client('http://localhost:8080', $factory, 'test-token');
+        $this->assertSame(['id' => 'queued-message'], $client->send(['text' => 'Hello']));
+        $this->assertSame('Bearer test-token', $request->headers['Authorization']);
+        $this->assertMatchesRegularExpression('/^[a-f0-9]{32}$/', $request->headers['Idempotency-Key']);
+        $firstKey = $request->headers['Idempotency-Key'];
+        $client->send(['text' => 'Another message']);
+        $this->assertNotSame($firstKey, $request->headers['Idempotency-Key']);
+    }
+
+    public function testTokenRejectsHeaderInjection(): void
+    {
+        $this->expectException(MWException::class);
+        new Client('http://localhost:8080', null, "token\r\nX-Injected: yes");
+    }
+
+    public function testEmptyBodyAndRepeatedRecipientHeaders(): void
+    {
+        $client = new Client('http://localhost:8080');
+        $payload = $client->buildPayload(
+            ['Cc' => ['one@example.com', 'two@example.com']],
+            new MailAddress('to@example.com'),
+            new MailAddress('from@example.com'),
+            'Subject',
+            ['text' => '']
+        );
+        $this->assertSame('', $payload['text']);
+        $this->assertSame([['email' => 'one@example.com'], ['email' => 'two@example.com']], $payload['cc']);
+    }
+
 }

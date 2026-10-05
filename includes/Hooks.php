@@ -29,17 +29,19 @@ class Hooks implements AlternateUserMailerHook
      * @param MailAddress $from
      * @param string $subject
      * @param string|array $body
-     * @return bool False on success (skips the default mailer), true on failure to
-     *   allow the default mailer to handle the message.
+     * @return bool|string False on acceptance; true when not configured; an error
+     *   string on failure, preventing an unsafe second submission via SMTP.
      */
     public function onAlternateUserMailer($headers, $to, $from, $subject, $body)
     {
-        global $wgMailAPIEndpoint;
+        global $wgMailAPIEndpoint, $wgMailAPIToken;
+        $token = (string)($wgMailAPIToken ?? '');
 
         $endpoint = (string)$wgMailAPIEndpoint;
-        if ($endpoint === '' && class_exists(MediaWikiServices::class)) {
+        if (class_exists(MediaWikiServices::class)) {
             $config = MediaWikiServices::getInstance()->getMainConfig();
-            if ($config->has('MailAPIEndpoint')) {
+            if ($token === '' && $config->has('MailAPIToken')) { $token = (string)$config->get('MailAPIToken'); }
+            if ($endpoint === '' && $config->has('MailAPIEndpoint')) {
                 $endpoint = (string)$config->get('MailAPIEndpoint');
             }
         }
@@ -53,12 +55,12 @@ class Hooks implements AlternateUserMailerHook
         }
 
         try {
-            $client = new Client($endpoint);
+            $client = new Client($endpoint, null, $token);
             $payload = $client->buildPayload($headers, $to, $from, $subject, $body);
             $response = $client->send($payload);
             $this->log(
                 'info',
-                'MailAPI accepted email for delivery. Message ID: {message_id}',
+                'MailAPI accepted email for processing. Message ID: {message_id}',
                 ['message_id' => $response['id'] ?? '(missing)']
             );
 
@@ -66,13 +68,13 @@ class Hooks implements AlternateUserMailerHook
         } catch (Throwable $e) {
             $this->log(
                 'error',
-                'MailAPI failed to send email; falling back to the default mailer: {error}',
+                'MailAPI submission failed: {error}',
                 [
                     'error' => $e->getMessage(),
                     'exception' => $e,
                 ]
             );
-            return true;
+            return 'Mail API submission failed: ' . $e->getMessage();
         }
     }
 
